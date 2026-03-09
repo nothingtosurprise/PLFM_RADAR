@@ -1,0 +1,237 @@
+`timescale 1ns / 1ps
+
+// ============================================================================
+// CDC FOR MULTI-BIT DATA (ADVANCED)
+// ============================================================================
+module cdc_adc_to_processing #(
+    parameter WIDTH = 8,
+    parameter STAGES = 3
+)(
+    input wire src_clk,
+    input wire dst_clk,
+    input wire reset_n,
+    input wire [WIDTH-1:0] src_data,
+    input wire src_valid,
+    output wire [WIDTH-1:0] dst_data,
+    output wire dst_valid
+);
+
+    // Gray encoding for safe CDC
+    function [WIDTH-1:0] binary_to_gray;
+        input [WIDTH-1:0] binary;
+        binary_to_gray = binary ^ (binary >> 1);
+    endfunction
+    
+    function [WIDTH-1:0] gray_to_binary;
+        input [WIDTH-1:0] gray;
+        reg [WIDTH-1:0] binary;
+        integer i;
+    begin
+        binary[WIDTH-1] = gray[WIDTH-1];
+        for (i = WIDTH-2; i >= 0; i = i - 1) begin
+            binary[i] = binary[i+1] ^ gray[i];
+        end
+        gray_to_binary = binary;
+    end
+    endfunction
+    
+    // Source domain registers
+    reg [WIDTH-1:0] src_data_reg;
+    reg [1:0] src_toggle = 2'b00;
+    reg src_toggle_sync = 0;
+    
+    // Destination domain registers
+    reg [WIDTH-1:0] dst_data_gray [0:STAGES-1];
+    reg [1:0] dst_toggle_sync [0:STAGES-1];
+    reg [WIDTH-1:0] dst_data_reg;
+    reg dst_valid_reg = 0;
+    reg [1:0] prev_dst_toggle = 2'b00;
+    
+    always @(posedge src_clk or negedge reset_n) begin
+        if (!reset_n) begin
+            src_data_reg <= 0;
+            src_toggle <= 2'b00;
+        end else if (src_valid) begin
+            src_data_reg <= src_data;
+            src_toggle <= src_toggle + 1;
+        end
+    end
+    
+    // CDC synchronization chain for data
+    genvar i;
+    generate
+        for (i = 0; i < STAGES; i = i + 1) begin : data_sync_chain
+            always @(posedge dst_clk or negedge reset_n) begin
+                if (!reset_n) begin
+                    if (i == 0) begin
+                        dst_data_gray[i] <= 0;
+                    end else begin
+                        dst_data_gray[i] <= dst_data_gray[i-1];
+                    end
+                end else begin
+                    if (i == 0) begin
+                        // Convert to gray code at domain crossing
+                        dst_data_gray[i] <= binary_to_gray(src_data_reg);
+                    end else begin
+                        dst_data_gray[i] <= dst_data_gray[i-1];
+                    end
+                end
+            end
+        end
+        
+        for (i = 0; i < STAGES; i = i + 1) begin : toggle_sync_chain
+            always @(posedge dst_clk or negedge reset_n) begin
+                if (!reset_n) begin
+                    if (i == 0) begin
+                        dst_toggle_sync[i] <= 2'b00;
+                    end else begin
+                        dst_toggle_sync[i] <= dst_toggle_sync[i-1];
+                    end
+                end else begin
+                    if (i == 0) begin
+                        dst_toggle_sync[i] <= src_toggle;
+                    end else begin
+                        dst_toggle_sync[i] <= dst_toggle_sync[i-1];
+                    end
+                end
+            end
+        end
+    endgenerate
+    
+    // Detect new data
+    always @(posedge dst_clk or negedge reset_n) begin
+        if (!reset_n) begin
+            dst_data_reg <= 0;
+            dst_valid_reg <= 0;
+            prev_dst_toggle <= 2'b00;
+        end else begin
+            // Convert from gray code
+            dst_data_reg <= gray_to_binary(dst_data_gray[STAGES-1]);
+            
+            // Check if toggle changed (new data)
+            if (dst_toggle_sync[STAGES-1] != prev_dst_toggle) begin
+                dst_valid_reg <= 1'b1;
+                prev_dst_toggle <= dst_toggle_sync[STAGES-1];
+            end else begin
+                dst_valid_reg <= 1'b0;
+            end
+        end
+    end
+    
+    assign dst_data = dst_data_reg;
+    assign dst_valid = dst_valid_reg;
+    
+endmodule
+
+// ============================================================================
+// CDC FOR SINGLE BIT SIGNALS
+// ============================================================================
+module cdc_single_bit #(
+    parameter STAGES = 3
+)(
+    input wire src_clk,
+    input wire dst_clk,
+    input wire reset_n,
+    input wire src_signal,
+    output wire dst_signal
+);
+
+    reg [STAGES-1:0] sync_chain;
+    
+    always @(posedge dst_clk or negedge reset_n) begin
+        if (!reset_n) begin
+            sync_chain <= 0;
+        end else begin
+            sync_chain <= {sync_chain[STAGES-2:0], src_signal};
+        end
+    end
+    
+    assign dst_signal = sync_chain[STAGES-1];
+    
+endmodule
+
+// ============================================================================
+// CDC FOR MULTI-BIT WITH HANDSHAKE
+// ============================================================================
+module cdc_handshake #(
+    parameter WIDTH = 32
+)(
+    input wire src_clk,
+    input wire dst_clk,
+    input wire reset_n,
+    input wire [WIDTH-1:0] src_data,
+    input wire src_valid,
+    output wire src_ready,
+    output wire [WIDTH-1:0] dst_data,
+    output wire dst_valid,
+    input wire dst_ready
+);
+
+    // Source domain
+    reg [WIDTH-1:0] src_data_reg;
+    reg src_busy = 0;
+    reg src_ack_sync = 0;
+    reg [1:0] src_ack_sync_chain = 2'b00;
+    
+    // Destination domain
+    reg [WIDTH-1:0] dst_data_reg;
+    reg dst_valid_reg = 0;
+    reg dst_req_sync = 0;
+    reg [1:0] dst_req_sync_chain = 2'b00;
+    reg dst_ack = 0;
+    
+    // Source clock domain
+    always @(posedge src_clk or negedge reset_n) begin
+        if (!reset_n) begin
+            src_data_reg <= 0;
+            src_busy <= 0;
+            src_ack_sync <= 0;
+            src_ack_sync_chain <= 2'b00;
+        end else begin
+            // Sync acknowledge from destination
+            src_ack_sync_chain <= {src_ack_sync_chain[0], dst_ack};
+            src_ack_sync <= src_ack_sync_chain[1];
+            
+            if (!src_busy && src_valid) begin
+                src_data_reg <= src_data;
+                src_busy <= 1'b1;
+            end else if (src_busy && src_ack_sync) begin
+                src_busy <= 1'b0;
+            end
+        end
+    end
+    
+    // Destination clock domain
+    always @(posedge dst_clk or negedge reset_n) begin
+        if (!reset_n) begin
+            dst_data_reg <= 0;
+            dst_valid_reg <= 0;
+            dst_req_sync <= 0;
+            dst_req_sync_chain <= 2'b00;
+            dst_ack <= 0;
+        end else begin
+            // Sync request from source
+            dst_req_sync_chain <= {dst_req_sync_chain[0], src_busy};
+            dst_req_sync <= dst_req_sync_chain[1];
+            
+            // Capture data when request arrives
+            if (dst_req_sync && !dst_valid_reg) begin
+                dst_data_reg <= src_data_reg;
+                dst_valid_reg <= 1'b1;
+                dst_ack <= 1'b1;
+            end else if (dst_valid_reg && dst_ready) begin
+                dst_valid_reg <= 1'b0;
+            end
+            
+            // Clear acknowledge after source sees it
+            if (dst_ack && !dst_req_sync) begin
+                dst_ack <= 1'b0;
+            end
+        end
+    end
+    
+    assign src_ready = !src_busy;
+    assign dst_data = dst_data_reg;
+    assign dst_valid = dst_valid_reg;
+    
+endmodule

@@ -1,0 +1,353 @@
+`timescale 1ns / 1ps
+
+module radar_receiver_final (
+    input wire clk,           // 100MHz    
+	 input wire reset_n,
+    
+	// ADC Physical Interface (LVDS Inputs)
+    input wire [7:0] adc_d_p,        // ADC Data P (LVDS)
+    input wire [7:0] adc_d_n,        // ADC Data N (LVDS)
+    input wire adc_dco_p,            // Data Clock Output P (400MHz LVDS)
+    input wire adc_dco_n,            // Data Clock Output N (400MHz LVDS)
+	 output wire adc_pwdn,
+    
+    output reg [31:0] doppler_output,
+    output reg doppler_valid,
+    output reg [4:0] doppler_bin,
+    output reg [5:0] range_bin
+);
+
+// ========== INTERNAL SIGNALS ==========
+wire use_long_chirp;
+wire [5:0] chirp_counter;
+wire chirp_start;
+wire azimuth_change;
+wire elevation_change;
+
+wire [1:0] segment_request;
+wire mem_request;
+wire [15:0] ref_i, ref_q;
+wire mem_ready;
+
+wire [15:0] adc_i_scaled, adc_q_scaled;
+wire adc_valid_sync;
+
+// Reference signals for the processing chain
+wire [15:0] long_chirp_real, long_chirp_imag;
+wire [15:0] short_chirp_real, short_chirp_imag;
+
+// ========== DOPPLER PROCESSING SIGNALS ==========
+wire [31:0] range_data_32bit;
+wire range_data_valid;
+wire new_chirp_frame;
+
+// Doppler processor outputs
+wire [31:0] doppler_spectrum;
+wire doppler_spectrum_valid;
+wire [4:0] doppler_bin_out;
+wire [5:0] doppler_range_bin_out;
+wire doppler_processing;
+wire doppler_frame_done;
+
+// ========== RANGE BIN DECIMATOR SIGNALS ==========
+wire signed [15:0] decimated_range_i;
+wire signed [15:0] decimated_range_q;
+wire decimated_range_valid;
+wire [5:0] decimated_range_bin;
+
+// ========== MODULE INSTANTIATIONS ==========
+reg clk_400m;
+
+lvds_to_cmos_400m clk_400m_inst(
+    // ADC Physical Interface (LVDS Inputs)
+    .clk_400m_p(adc_dco_p),            // Data Clock Output P (400MHz LVDS, 2.5V)
+    .clk_400m_n(adc_dco_n),            // Data Clock Output N (400MHz LVDS, 2.5V)
+    .reset_n(reset_n),              // Active-low reset
+    
+    // CMOS Output Interface (400MHz Domain)
+    .clk_400m_cmos(clk_400m)         // ADC data clock (CMOS, 3.3V)
+);
+
+// 1. ADC + CDC + AGC
+
+// CMOS Output Interface (400MHz Domain)
+wire [7:0] adc_data_cmos;  // 8-bit ADC data (CMOS)
+wire adc_dco_cmos;         // ADC data clock (CMOS, 400MHz)
+wire adc_valid;            // Data valid signal
+
+wire [7:0] cdc_data_cmos;  // 8-bit ADC data (CMOS)
+wire cdc_valid;            // Data valid signal
+
+
+ad9484_lvds_to_cmos_400m adc (
+	.adc_d_p(adc_d_p),
+	.adc_d_n(adc_d_n),
+	.adc_dco_p(adc_dco_p),
+	.adc_dco_n(adc_dco_n),
+	.reset_n(reset_n),
+	.adc_data_cmos(adc_data_cmos),
+	.adc_dco_cmos(adc_dco_cmos),
+	.adc_valid(adc_valid),
+	.adc_pwdn(adc_pwdn)
+);
+
+cdc_adc_to_processing #(
+    .WIDTH(8),
+    .STAGES(3)
+)cdc(
+    .src_clk(adc_dco_cmos),
+    .dst_clk(clk_400m),
+    .reset_n(reset_n),
+    .src_data(adc_data_cmos),
+    .src_valid(adc_valid),
+    .dst_data(cdc_data_cmos),
+    .dst_valid(cdc_valid)
+);
+
+// 2. DDC Input Interface
+wire signed [17:0] ddc_out_i;
+wire signed [17:0] ddc_out_q;
+
+wire ddc_valid_i;
+wire ddc_valid_q;
+
+ddc_400m_enhanced ddc(
+    .clk_400m(clk_400m),           // 400MHz clock from ADC DCO
+    .clk_100m(clk),           // 100MHz system clock //used by the 2 FIR
+    .reset_n(reset_n),
+    .adc_data(cdc_data_cmos),     // ADC data at 400MHz (unsigned 0-255)
+    .adc_data_valid_i(cdc_valid),     // Valid at 400MHz
+    .adc_data_valid_q(cdc_valid),     // Valid at 400MHz
+    .baseband_i(ddc_out_i), // I output at 100MHz
+    .baseband_q(ddc_out_q), // Q output at 100MHz  
+    .baseband_valid_i(ddc_valid_i),     // Valid at 100MHz
+	 .baseband_valid_q(ddc_valid_q),
+	 .mixers_enable(1'b1),
+    .bypass_mode(1'b1)
+);
+
+ddc_input_interface ddc_if (
+    .clk(clk),
+    .reset_n(reset_n),
+    .ddc_i(ddc_out_i),
+    .ddc_q(ddc_out_q),
+    .valid_i(ddc_valid_i),
+    .valid_q(ddc_valid_q),
+    .adc_i(adc_i_scaled),
+    .adc_q(adc_q_scaled),
+    .adc_valid(adc_valid_sync),
+    .data_sync_error()
+);
+
+// 3. Dual Chirp Memory Loader
+
+chirp_memory_loader_param chirp_mem (
+    .clk(clk),
+    .reset_n(reset_n),
+    .segment_select(segment_request),
+    .mem_request(mem_request),
+    .use_long_chirp(use_long_chirp),
+	 .sample_addr(sample_addr_from_chain),
+    .ref_i(ref_i),
+    .ref_q(ref_q),
+    .mem_ready(mem_ready)
+);
+
+// Sample address generator
+reg [9:0] sample_addr_reg;
+always @(posedge clk or negedge reset_n) begin
+    if (!reset_n) begin
+        sample_addr_reg <= 0;
+    end else if (mem_request) begin
+        sample_addr_reg <= sample_addr_reg + 1;
+        if (sample_addr_reg == 1023) sample_addr_reg <= 0;
+    end
+end
+assign sample_addr_wire = sample_addr_reg;
+
+// 4. CRITICAL: Reference Chirp Latency Buffer
+// This aligns reference data with FFT output (2159 cycle delay)
+wire [15:0] delayed_ref_i, delayed_ref_q;
+wire mem_ready_delayed;
+
+latency_buffer_2159 #(
+    .DATA_WIDTH(32),  // 16-bit I + 16-bit Q
+	.LATENCY(3187)
+) ref_latency_buffer (
+    .clk(clk),
+    .reset_n(reset_n),
+    .data_in({ref_i, ref_q}),
+    .valid_in(mem_request),
+    .data_out({delayed_ref_i, delayed_ref_q}),
+    .valid_out(mem_ready_delayed)
+);
+
+// Assign delayed reference signals
+assign long_chirp_real = delayed_ref_i;
+assign long_chirp_imag = delayed_ref_q;
+assign short_chirp_real = delayed_ref_i;
+assign short_chirp_imag = delayed_ref_q;
+
+// 5. Dual Chirp Matched Filter
+wire [9:0] sample_addr_from_chain; 
+
+wire signed [15:0] range_profile_i;
+wire signed [15:0] range_profile_q;
+wire range_valid;
+
+matched_filter_multi_segment mf_dual (
+    .clk(clk),
+    .reset_n(reset_n),
+    .ddc_i({{2{adc_i_scaled[15]}}, adc_i_scaled}),
+    .ddc_q({{2{adc_q_scaled[15]}}, adc_q_scaled}),
+    .ddc_valid(adc_valid_sync),
+    .use_long_chirp(use_long_chirp),
+    .chirp_counter(chirp_counter),
+    .mc_new_chirp(mc_new_chirp),
+    .mc_new_elevation(mc_new_elevation),
+    .mc_new_azimuth(mc_new_azimuth),
+	 .long_chirp_real(delayed_ref_i),      // From latency buffer
+    .long_chirp_imag(delayed_ref_q),
+    .short_chirp_real(delayed_ref_i),     // Same for short chirp
+    .short_chirp_imag(delayed_ref_q),
+    .segment_request(segment_request),
+    .mem_request(mem_request),
+	 .sample_addr_out(sample_addr_from_chain),
+    .ref_i(16'd0),          // Direct ref to multi_seg
+    .ref_q(16'd0),
+    .mem_ready(mem_ready),
+    .pc_i_w(range_profile_i),
+    .pc_q_w(range_profile_q),
+    .pc_valid_w(range_valid)
+);
+
+// ========== CRITICAL: RANGE BIN DECIMATOR ==========
+// Convert 1024 range bins to 64 bins for Doppler
+range_bin_decimator #(
+    .INPUT_BINS(1024),
+    .OUTPUT_BINS(64),
+    .DECIMATION_FACTOR(16)
+) range_decim (
+    .clk(clk),
+    .reset_n(reset_n),
+    .range_i_in(range_profile_i),
+    .range_q_in(range_profile_q),
+    .range_valid_in(range_valid),
+    .range_i_out(decimated_range_i),
+    .range_q_out(decimated_range_q),
+    .range_valid_out(decimated_range_valid),
+    .range_bin_index(decimated_range_bin),
+    .decimation_mode(2'b01),           // Peak detection mode
+    .start_bin(10'd0)
+);
+
+// ========== FRAME SYNC USING chirp_counter ==========
+reg [5:0] chirp_counter_prev;
+reg new_frame_pulse;
+
+always @(posedge clk or negedge reset_n) begin
+    if (!reset_n) begin
+        chirp_counter_prev <= 6'd0;
+        new_frame_pulse <= 1'b0;
+    end else begin
+        // Default: no pulse
+        new_frame_pulse <= 1'b0;
+        
+        // ===== CHOOSE ONE FRAME DETECTION METHOD =====
+        
+        // METHOD A: Detect frame start at chirp_counter = 0
+        // (Assumes frames are 64 chirps: 0-63)
+        //if (chirp_counter == 6'd0 && chirp_counter_prev != 6'd0) begin
+        //    new_frame_pulse <= 1'b1;
+        //end
+        
+        // METHOD B: Detect frame start at chirp_counter = 0 AND 32
+        // (For 32-chirp frames in a 64-chirp sequence)
+         if ((chirp_counter == 6'd0 || chirp_counter == 6'd32) && 
+             (chirp_counter_prev != chirp_counter)) begin
+             new_frame_pulse <= 1'b1;
+         end
+        
+        // METHOD C: Programmable frame start
+        // localparam FRAME_START_CHIRP = 6'd0;  // Set based on your sequence
+        // if (chirp_counter == FRAME_START_CHIRP && 
+        //     chirp_counter_prev != FRAME_START_CHIRP) begin
+        //     new_frame_pulse <= 1'b1;
+        // end
+        
+        // Store previous value
+        chirp_counter_prev <= chirp_counter;
+    end
+end
+
+assign new_chirp_frame = new_frame_pulse;
+
+// ========== DATA PACKING FOR DOPPLER ==========
+assign range_data_32bit = {decimated_range_q, decimated_range_i};
+assign range_data_valid = decimated_range_valid;
+
+// ========== DOPPLER PROCESSOR ==========
+doppler_processor_optimized #(
+    .DOPPLER_FFT_SIZE(32),
+    .RANGE_BINS(64),
+    .CHIRPS_PER_FRAME(32)  // MUST MATCH YOUR ACTUAL FRAME SIZE!
+) doppler_proc (
+    .clk(clk),
+    .reset_n(reset_n),
+    .range_data(range_data_32bit),
+    .data_valid(range_data_valid),
+    .new_chirp_frame(new_chirp_frame),
+    
+    // Outputs
+    .doppler_output(doppler_output),
+    .doppler_valid(doppler_valid),
+    .doppler_bin(doppler_bin),
+    .range_bin(doppler_range_bin_out),
+    
+    // Status
+    .processing_active(doppler_processing),
+    .frame_complete(doppler_frame_done),
+    .status()
+);
+
+// ========== OUTPUT CONNECTIONS ==========
+assign doppler_range_bin = doppler_range_bin_out;
+assign doppler_processing_active = doppler_processing;
+assign doppler_frame_complete = doppler_frame_done;
+
+// ========== STATUS ==========
+
+// ========== DEBUG AND VERIFICATION ==========
+reg [31:0] frame_counter;
+reg [5:0] chirps_in_current_frame;
+
+always @(posedge clk or negedge reset_n) begin
+    if (!reset_n) begin
+        frame_counter <= 0;
+        chirps_in_current_frame <= 0;
+    end else begin
+        // Count chirps in current frame
+        if (range_data_valid && decimated_range_bin == 0) begin
+            // First range bin of a chirp
+            chirps_in_current_frame <= chirps_in_current_frame + 1;
+        end
+        
+        // Detect frame completion
+        if (new_chirp_frame) begin
+            frame_counter <= frame_counter + 1;
+            $display("[TOP] Frame %0d started. Previous frame had %0d chirps", 
+                     frame_counter, chirps_in_current_frame);
+            chirps_in_current_frame <= 0;
+        end
+        
+        // Monitor chirp counter pattern
+        if (chirp_counter != chirp_counter_prev) begin
+            $display("[TOP] chirp_counter: %0d ? %0d", 
+                     chirp_counter_prev, chirp_counter);
+        end
+    end
+end
+
+
+
+endmodule
