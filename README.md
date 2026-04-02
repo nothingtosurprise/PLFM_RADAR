@@ -6,11 +6,11 @@
 [![Frequency: 10.5GHz](https://img.shields.io/badge/Frequency-10.5GHz-blue)](https://github.com/NawfalMotii79/PLFM_RADAR)
 [![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](https://github.com/NawfalMotii79/PLFM_RADAR/pulls)
 
-![AERIS-10 Radar System](/8_Utils/3fb1dabf-2c6d-4b5d-b471-48bc461ce914.jpg)
+![AERIS-10 Radar System](https://raw.githubusercontent.com/NawfalMotii79/PLFM_RADAR/main/8_Utils/3fb1dabf-2c6d-4b5d-b471-48bc461ce914.jpg)
 
 AERIS-10 is an open-source, low-cost 10.5 GHz phased array radar system featuring Pulse Linear Frequency Modulated (LFM) modulation. Available in two versions (3km and 20km range), it's designed for researchers, drone developers, and serious SDR enthusiasts who want to explore and experiment with phased array radar technology.
 
-![AERIS-10 Antenna Array](/8_Utils/Antenna_Array.jpg)
+![AERIS-10 Antenna Array](https://raw.githubusercontent.com/NawfalMotii79/PLFM_RADAR/main/8_Utils/Antenna_Array.jpg)
 
 ## 📡 Overview
 
@@ -30,7 +30,7 @@ The AERIS-10 project aims to democratize radar technology by providing a fully o
 
 ## 🏗️ System Architecture
 
-![AERIS-10 System Diagram](/8_Utils/RADAR_V6_V2.png)
+![AERIS-10 System Diagram](https://raw.githubusercontent.com/NawfalMotii79/PLFM_RADAR/main/8_Utils/RADAR_V6_V2.png)
 
 ### Hardware Components
 
@@ -110,7 +110,7 @@ The AERIS-10 main sub-systems are:
    - Map integration
    - Radar control interface
 
-![AERIS-10 GUI Demo](/8_Utils/GUI_V6.gif)
+![AERIS-10 GUI Demo](https://raw.githubusercontent.com/NawfalMotii79/PLFM_RADAR/main/8_Utils/GUI_V6.gif)
 
 ## 📊 Technical Specifications
 
@@ -224,7 +224,7 @@ I welcome serious inquiries from researchers, engineers, and potential collabora
 
 ## 💰 Sponsors
 
-![PCBWay Sponsor Logo](/8_Utils/PCBWAY.jpg)
+![PCBWay Sponsor Logo](https://raw.githubusercontent.com/NawfalMotii79/PLFM_RADAR/main/8_Utils/PCBWAY.jpg)
 
 ---
 
