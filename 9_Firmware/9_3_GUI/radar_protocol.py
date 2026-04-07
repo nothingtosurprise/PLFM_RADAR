@@ -2,17 +2,26 @@
 """
 AERIS-10 Radar Protocol Layer
 ===============================
-Pure-logic module for FT601 packet parsing and command building.
+Pure-logic module for USB packet parsing and command building.
 No GUI dependencies — safe to import from tests and headless scripts.
 
-Matches usb_data_interface.v packet format exactly.
+Supports two USB interfaces:
+  - FT601 USB 3.0 (32-bit, 200T dev board) via ftd3xx
+  - FT2232H USB 2.0 (8-bit, 50T production board) via pyftdi
 
-USB Packet Protocol:
+USB Packet Protocol (FT601, 35-byte):
   TX (FPGA→Host):
     Data packet:  [0xAA] [range 4×32b] [doppler 4×32b] [det 1B] [0x55]
     Status packet: [0xBB] [status 6×32b] [0x55]
   RX (Host→FPGA):
     Command word:  {opcode[31:24], addr[23:16], value[15:0]}
+
+USB Packet Protocol (FT2232H, 11-byte compact):
+  TX (FPGA→Host):
+    Data packet:  [0xAA] [range_q 2B] [range_i 2B] [dop_re 2B] [dop_im 2B] [det 1B] [0x55]
+    Status packet: [0xBB] [status 6×32b] [0x55]  (same 26-byte format)
+  RX (Host→FPGA):
+    Command: 4 bytes received sequentially {opcode, addr, value_hi, value_lo}
 """
 
 import os
@@ -37,6 +46,11 @@ log = logging.getLogger("radar_protocol")
 HEADER_BYTE = 0xAA
 FOOTER_BYTE = 0x55
 STATUS_HEADER_BYTE = 0xBB
+
+# Packet sizes
+DATA_PACKET_SIZE_FT601 = 35     # FT601: 1 + 16 + 16 + 1 + 1
+DATA_PACKET_SIZE_FT2232H = 11   # FT2232H: 1 + 4 + 2 + 2 + 1 + 1
+STATUS_PACKET_SIZE = 26          # Same for both: 1 + 24 + 1
 
 NUM_RANGE_BINS = 64
 NUM_DOPPLER_BINS = 32
@@ -199,6 +213,43 @@ class RadarProtocol:
         return result
 
     @staticmethod
+    def parse_data_packet_compact(raw: bytes) -> Optional[Dict[str, Any]]:
+        """
+        Parse a compact 11-byte data packet from the FT2232H byte stream.
+        Returns dict with keys: 'range_i', 'range_q', 'doppler_i', 'doppler_q',
+        'detection', or None if invalid.
+
+        Compact packet format (FT2232H, 11 bytes):
+          Byte 0:    0xAA (header)
+          Bytes 1-2: range_q[15:0] MSB first
+          Bytes 3-4: range_i[15:0] MSB first
+          Bytes 5-6: doppler_real[15:0] MSB first
+          Bytes 7-8: doppler_imag[15:0] MSB first
+          Byte 9:    {7'b0, cfar_detection}
+          Byte 10:   0x55 (footer)
+        """
+        if len(raw) < DATA_PACKET_SIZE_FT2232H:
+            return None
+        if raw[0] != HEADER_BYTE:
+            return None
+        if raw[10] != FOOTER_BYTE:
+            return None
+
+        range_q = _to_signed16(struct.unpack_from(">H", raw, 1)[0])
+        range_i = _to_signed16(struct.unpack_from(">H", raw, 3)[0])
+        doppler_i = _to_signed16(struct.unpack_from(">H", raw, 5)[0])
+        doppler_q = _to_signed16(struct.unpack_from(">H", raw, 7)[0])
+        detection = raw[9] & 0x01
+
+        return {
+            "range_i": range_i,
+            "range_q": range_q,
+            "doppler_i": doppler_i,
+            "doppler_q": doppler_q,
+            "detection": detection,
+        }
+
+    @staticmethod
     def parse_status_packet(raw: bytes) -> Optional[StatusResponse]:
         """
         Parse a status response packet.
@@ -241,25 +292,31 @@ class RadarProtocol:
         return sr
 
     @staticmethod
-    def find_packet_boundaries(buf: bytes) -> List[Tuple[int, int, str]]:
+    def find_packet_boundaries(buf: bytes,
+                               compact: bool = False) -> List[Tuple[int, int, str]]:
         """
         Scan buffer for packet start markers (0xAA data, 0xBB status).
         Returns list of (start_idx, expected_end_idx, packet_type).
+
+        Args:
+            buf: Raw byte buffer from USB read.
+            compact: If True, use 11-byte compact packets (FT2232H).
+                     If False, use 35-byte packets (FT601, default).
         """
+        data_size = DATA_PACKET_SIZE_FT2232H if compact else DATA_PACKET_SIZE_FT601
         packets = []
         i = 0
         while i < len(buf):
             if buf[i] == HEADER_BYTE:
-                # Data packet: 35 bytes (all streams)
-                end = i + 35
+                end = i + data_size
                 if end <= len(buf):
                     packets.append((i, end, "data"))
                     i = end
                 else:
                     break
             elif buf[i] == STATUS_HEADER_BYTE:
-                # Status packet: 26 bytes (6 words + header + footer)
-                end = i + 26
+                # Status packet: 26 bytes (same for both interfaces)
+                end = i + STATUS_PACKET_SIZE
                 if end <= len(buf):
                     packets.append((i, end, "status"))
                     i = end
@@ -407,6 +464,150 @@ class FT601Connection:
             pkt += struct.pack(">I", ((dword << 16) & 0xFFFFFFFF))
             pkt += struct.pack(">I", ((dword << 24) & 0xFFFFFFFF))
 
+            pkt.append(detection & 0x01)
+            pkt.append(FOOTER_BYTE)
+
+            buf += pkt
+
+        return bytes(buf)
+
+
+# ============================================================================
+# FT2232H USB 2.0 Connection (pyftdi, 245 Synchronous FIFO)
+# ============================================================================
+
+# Optional pyftdi import
+try:
+    from pyftdi.ftdi import Ftdi as PyFtdi
+    PYFTDI_AVAILABLE = True
+except ImportError:
+    PYFTDI_AVAILABLE = False
+
+
+class FT2232HConnection:
+    """
+    FT2232H USB 2.0 Hi-Speed FIFO bridge communication.
+    Uses pyftdi in 245 Synchronous FIFO mode (Channel A).
+    VID:PID = 0x0403:0x6010 (FTDI default for FT2232H).
+    """
+
+    VID = 0x0403
+    PID = 0x6010
+
+    def __init__(self, mock: bool = True):
+        self._mock = mock
+        self._ftdi = None
+        self._lock = threading.Lock()
+        self.is_open = False
+        # Mock state
+        self._mock_frame_num = 0
+        self._mock_rng = np.random.RandomState(42)
+
+    def open(self, device_index: int = 0) -> bool:
+        if self._mock:
+            self.is_open = True
+            log.info("FT2232H mock device opened (no hardware)")
+            return True
+
+        if not PYFTDI_AVAILABLE:
+            log.error("pyftdi not installed — cannot open real FT2232H device")
+            return False
+
+        try:
+            self._ftdi = PyFtdi()
+            url = f"ftdi://0x{self.VID:04x}:0x{self.PID:04x}/{device_index + 1}"
+            self._ftdi.open_from_url(url)
+            # Configure for 245 Synchronous FIFO mode
+            self._ftdi.set_bitmode(0xFF, PyFtdi.BitMode.SYNCFF)
+            # Set USB transfer size for throughput
+            self._ftdi.read_data_set_chunksize(65536)
+            self._ftdi.write_data_set_chunksize(65536)
+            # Purge buffers
+            self._ftdi.purge_buffers()
+            self.is_open = True
+            log.info(f"FT2232H device opened: {url}")
+            return True
+        except Exception as e:
+            log.error(f"FT2232H open failed: {e}")
+            return False
+
+    def close(self):
+        if self._ftdi is not None:
+            try:
+                self._ftdi.close()
+            except Exception:
+                pass
+            self._ftdi = None
+        self.is_open = False
+
+    def read(self, size: int = 4096) -> Optional[bytes]:
+        """Read raw bytes from FT2232H. Returns None on error/timeout."""
+        if not self.is_open:
+            return None
+
+        if self._mock:
+            return self._mock_read(size)
+
+        with self._lock:
+            try:
+                data = self._ftdi.read_data(size)
+                return bytes(data) if data else None
+            except Exception as e:
+                log.error(f"FT2232H read error: {e}")
+                return None
+
+    def write(self, data: bytes) -> bool:
+        """Write raw bytes to FT2232H (4-byte commands)."""
+        if not self.is_open:
+            return False
+
+        if self._mock:
+            log.info(f"FT2232H mock write: {data.hex()}")
+            return True
+
+        with self._lock:
+            try:
+                written = self._ftdi.write_data(data)
+                return written == len(data)
+            except Exception as e:
+                log.error(f"FT2232H write error: {e}")
+                return False
+
+    def _mock_read(self, size: int) -> bytes:
+        """
+        Generate synthetic compact radar data packets (11-byte) for testing.
+        Same target simulation as FT601 mock but using compact format.
+        """
+        time.sleep(0.05)  # Simulate USB latency
+        self._mock_frame_num += 1
+
+        buf = bytearray()
+        num_packets = min(32, size // DATA_PACKET_SIZE_FT2232H)
+        for _ in range(num_packets):
+            rbin = self._mock_rng.randint(0, NUM_RANGE_BINS)
+            dbin = self._mock_rng.randint(0, NUM_DOPPLER_BINS)
+
+            range_i = int(self._mock_rng.normal(0, 100))
+            range_q = int(self._mock_rng.normal(0, 100))
+            if abs(rbin - 20) < 3:
+                range_i += 5000
+                range_q += 3000
+
+            dop_i = int(self._mock_rng.normal(0, 50))
+            dop_q = int(self._mock_rng.normal(0, 50))
+            if abs(rbin - 20) < 3 and abs(dbin - 8) < 2:
+                dop_i += 8000
+                dop_q += 4000
+
+            detection = 1 if (abs(rbin - 20) < 2 and abs(dbin - 8) < 2) else 0
+
+            # Build compact 11-byte packet
+            pkt = bytearray()
+            pkt.append(HEADER_BYTE)
+            pkt += struct.pack(">h", np.clip(range_q, -32768, 32767))
+            pkt += struct.pack(">h", np.clip(range_i, -32768, 32767))
+            pkt += struct.pack(">h", np.clip(dop_i, -32768, 32767))
+            pkt += struct.pack(">h", np.clip(dop_q, -32768, 32767))
             pkt.append(detection & 0x01)
             pkt.append(FOOTER_BYTE)
 
@@ -579,10 +780,11 @@ class ReplayConnection:
     """
 
     def __init__(self, npy_dir: str, use_mti: bool = True,
-                 replay_fps: float = 5.0):
+                 replay_fps: float = 5.0, compact: bool = False):
         self._npy_dir = npy_dir
         self._use_mti = use_mti
         self._replay_fps = max(replay_fps, 0.1)
+        self._compact = compact  # True = FT2232H 11-byte packets
         self._lock = threading.Lock()
         self.is_open = False
         self._packets: bytes = b""
@@ -756,8 +958,9 @@ class ReplayConnection:
             det = np.zeros((NUM_RANGE_BINS, NUM_DOPPLER_BINS), dtype=bool)
 
         det_count = int(det.sum())
-        log.info(f"Replay: rebuilt {NUM_CELLS} packets "
-                 f"(MTI={'ON' if self._mti_enable else 'OFF'}, "
+        pkt_fmt = "compact" if self._compact else "FT601"
+        log.info(f"Replay: rebuilt {NUM_CELLS} packets ({pkt_fmt}, "
+                 f"MTI={'ON' if self._mti_enable else 'OFF'}, "
                  f"DC_notch={self._dc_notch_width}, "
                  f"CFAR={'ON' if self._cfar_enable else 'OFF'} "
                  f"G={self._cfar_guard} T={self._cfar_train} "
@@ -767,8 +970,38 @@ class ReplayConnection:
         range_i = self._range_i_vec
         range_q = self._range_q_vec
 
-        # Pre-allocate buffer (35 bytes per packet * 2048 cells)
-        buf = bytearray(NUM_CELLS * 35)
+        if self._compact:
+            return self._build_packets_compact(range_i, range_q, dop_i, dop_q, det)
+        else:
+            return self._build_packets_ft601(range_i, range_q, dop_i, dop_q, det)
+
+    def _build_packets_compact(self, range_i, range_q, dop_i, dop_q, det) -> bytes:
+        """Build compact 11-byte packets for FT2232H interface."""
+        buf = bytearray(NUM_CELLS * DATA_PACKET_SIZE_FT2232H)
+        pos = 0
+        for rbin in range(NUM_RANGE_BINS):
+            ri = int(np.clip(range_i[rbin], -32768, 32767))
+            rq = int(np.clip(range_q[rbin], -32768, 32767))
+            rq_bytes = struct.pack(">h", rq)
+            ri_bytes = struct.pack(">h", ri)
+            for dbin in range(NUM_DOPPLER_BINS):
+                di = int(np.clip(dop_i[rbin, dbin], -32768, 32767))
+                dq = int(np.clip(dop_q[rbin, dbin], -32768, 32767))
+                d = 1 if det[rbin, dbin] else 0
+
+                buf[pos] = HEADER_BYTE; pos += 1
+                buf[pos:pos+2] = rq_bytes; pos += 2
+                buf[pos:pos+2] = ri_bytes; pos += 2
+                buf[pos:pos+2] = struct.pack(">h", di); pos += 2
+                buf[pos:pos+2] = struct.pack(">h", dq); pos += 2
+                buf[pos] = d; pos += 1
+                buf[pos] = FOOTER_BYTE; pos += 1
+
+        return bytes(buf)
+
+    def _build_packets_ft601(self, range_i, range_q, dop_i, dop_q, det) -> bytes:
+        """Build 35-byte packets for FT601 interface."""
+        buf = bytearray(NUM_CELLS * DATA_PACKET_SIZE_FT601)
         pos = 0
         for rbin in range(NUM_RANGE_BINS):
             ri = int(np.clip(range_i[rbin], -32768, 32767)) & 0xFFFF
@@ -879,18 +1112,20 @@ class DataRecorder:
 
 class RadarAcquisition(threading.Thread):
     """
-    Background thread: reads from FT601, parses packets, assembles frames,
-    and pushes complete frames to the display queue.
+    Background thread: reads from USB (FT601 or FT2232H), parses packets,
+    assembles frames, and pushes complete frames to the display queue.
     """
 
-    def __init__(self, connection: FT601Connection, frame_queue: queue.Queue,
+    def __init__(self, connection, frame_queue: queue.Queue,
                  recorder: Optional[DataRecorder] = None,
-                 status_callback=None):
+                 status_callback=None,
+                 compact: bool = False):
         super().__init__(daemon=True)
         self.conn = connection
         self.frame_queue = frame_queue
         self.recorder = recorder
         self._status_callback = status_callback
+        self._compact = compact  # True for FT2232H 11-byte packets
         self._stop_event = threading.Event()
         self._frame = RadarFrame()
         self._sample_idx = 0
@@ -900,17 +1135,23 @@ class RadarAcquisition(threading.Thread):
         self._stop_event.set()
 
     def run(self):
-        log.info("Acquisition thread started")
+        log.info(f"Acquisition thread started (compact={self._compact})")
         while not self._stop_event.is_set():
             raw = self.conn.read(4096)
             if raw is None or len(raw) == 0:
                 time.sleep(0.01)
                 continue
 
-            packets = RadarProtocol.find_packet_boundaries(raw)
+            packets = RadarProtocol.find_packet_boundaries(
+                raw, compact=self._compact)
             for start, end, ptype in packets:
                 if ptype == "data":
-                    parsed = RadarProtocol.parse_data_packet(raw[start:end])
+                    if self._compact:
+                        parsed = RadarProtocol.parse_data_packet_compact(
+                            raw[start:end])
+                    else:
+                        parsed = RadarProtocol.parse_data_packet(
+                            raw[start:end])
                     if parsed is not None:
                         self._ingest_sample(parsed)
                 elif ptype == "status":

@@ -35,7 +35,7 @@
 set default_server   "localhost"
 set default_port     3121
 set script_dir       [file dirname [file normalize [info script]]]
-set project_root     [file normalize [file join $script_dir ".."]]
+set project_root     [file normalize [file join $script_dir "../.."]]
 set default_ltx      [file join $project_root "build" "aeris10_radar.runs" "impl_ila" "radar_system_top.ltx"]
 set default_output_base [file join $project_root "build" "captures"]
 set default_depth    4096
