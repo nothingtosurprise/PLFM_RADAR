@@ -641,6 +641,7 @@ SystemError_t checkSystemHealth(void) {
         if (s0 == GPIO_PIN_RESET || s1 == GPIO_PIN_RESET) {
             current_error = ERROR_AD9523_CLOCK;
             DIAG_ERR("CLK", "AD9523 clock health check FAILED (STATUS0=%d STATUS1=%d)", s0, s1);
+            return current_error;
         }
         last_clock_check = HAL_GetTick();
     }
@@ -651,10 +652,12 @@ SystemError_t checkSystemHealth(void) {
         if (!tx_locked) {
             current_error = ERROR_ADF4382_TX_UNLOCK;
             DIAG_ERR("LO", "Health check: TX LO UNLOCKED");
+            return current_error;
         }
         if (!rx_locked) {
             current_error = ERROR_ADF4382_RX_UNLOCK;
             DIAG_ERR("LO", "Health check: RX LO UNLOCKED");
+            return current_error;
         }
     }
 
@@ -663,14 +666,14 @@ SystemError_t checkSystemHealth(void) {
         if (!adarManager.verifyDeviceCommunication(i)) {
             current_error = ERROR_ADAR1000_COMM;
             DIAG_ERR("BF", "Health check: ADAR1000 #%d comm FAILED", i);
-            break;
+            return current_error;
         }
 
         float temp = adarManager.readTemperature(i);
         if (temp > 85.0f) {
             current_error = ERROR_ADAR1000_TEMP;
             DIAG_ERR("BF", "Health check: ADAR1000 #%d OVERTEMP %.1fC > 85C", i, temp);
-            break;
+            return current_error;
         }
     }
 
@@ -680,6 +683,7 @@ SystemError_t checkSystemHealth(void) {
         if (!GY85_Update(&imu)) {
             current_error = ERROR_IMU_COMM;
             DIAG_ERR("IMU", "Health check: GY85_Update() FAILED");
+            return current_error;
         }
         last_imu_check = HAL_GetTick();
     }
@@ -691,6 +695,7 @@ SystemError_t checkSystemHealth(void) {
         if (pressure < 30000.0 || pressure > 110000.0 || isnan(pressure)) {
             current_error = ERROR_BMP180_COMM;
             DIAG_ERR("SYS", "Health check: BMP180 pressure out of range: %.0f", pressure);
+            return current_error;
         }
         last_bmp_check = HAL_GetTick();
     }
@@ -703,6 +708,7 @@ SystemError_t checkSystemHealth(void) {
     if (HAL_GetTick() - last_gps_fix > 30000) {
         current_error = ERROR_GPS_COMM;
         DIAG_WARN("SYS", "Health check: GPS no fix for >30s");
+        return current_error;
     }
 
     // 7. Check RF Power Amplifier Current
@@ -711,12 +717,12 @@ SystemError_t checkSystemHealth(void) {
             if (Idq_reading[i] > 2.5f) {
                 current_error = ERROR_RF_PA_OVERCURRENT;
                 DIAG_ERR("PA", "Health check: PA ch%d OVERCURRENT Idq=%.3fA > 2.5A", i, Idq_reading[i]);
-                break;
+                return current_error;
             }
             if (Idq_reading[i] < 0.1f) {
                 current_error = ERROR_RF_PA_BIAS;
                 DIAG_ERR("PA", "Health check: PA ch%d BIAS FAULT Idq=%.3fA < 0.1A", i, Idq_reading[i]);
-                break;
+                return current_error;
             }
         }
     }
@@ -725,6 +731,7 @@ SystemError_t checkSystemHealth(void) {
     if (temperature > 75.0f) {
         current_error = ERROR_TEMPERATURE_HIGH;
         DIAG_ERR("SYS", "Health check: System OVERTEMP %.1fC > 75C", temperature);
+        return current_error;
     }
 
     // 9. Simple watchdog check
@@ -732,6 +739,7 @@ SystemError_t checkSystemHealth(void) {
     if (HAL_GetTick() - last_health_check > 60000) {
         current_error = ERROR_WATCHDOG_TIMEOUT;
         DIAG_ERR("SYS", "Health check: Watchdog timeout (>60s since last check)");
+        return current_error;
     }
     last_health_check = HAL_GetTick();
 
@@ -921,38 +929,41 @@ bool checkSystemHealthStatus(void) {
 // Get system status for GUI
 // Get system status for GUI with 8 temperature variables
 void getSystemStatusForGUI(char* status_buffer, size_t buffer_size) {
-    char temp_buffer[200];
-    char final_status[500] = "System Status: ";
+    // Build status string directly in the output buffer using offset-tracked
+    // snprintf.  Each call returns the number of chars written (excluding NUL),
+    // so we advance 'off' and shrink 'rem' to guarantee we never overflow.
+    size_t off = 0;
+    size_t rem = buffer_size;
+    int w;
 
     // Basic status
     if (system_emergency_state) {
-        strcat(final_status, "EMERGENCY_STOP|");
+        w = snprintf(status_buffer + off, rem, "System Status: EMERGENCY_STOP|");
     } else {
-        strcat(final_status, "NORMAL|");
+        w = snprintf(status_buffer + off, rem, "System Status: NORMAL|");
     }
+    if (w > 0 && (size_t)w < rem) { off += (size_t)w; rem -= (size_t)w; }
 
     // Error information
-    snprintf(temp_buffer, sizeof(temp_buffer), "LastError:%d|ErrorCount:%lu|",
-             last_error, error_count);
-    strcat(final_status, temp_buffer);
+    w = snprintf(status_buffer + off, rem, "LastError:%d|ErrorCount:%lu|",
+                 last_error, error_count);
+    if (w > 0 && (size_t)w < rem) { off += (size_t)w; rem -= (size_t)w; }
 
     // Sensor status
-    snprintf(temp_buffer, sizeof(temp_buffer), "IMU:%.1f,%.1f,%.1f|GPS:%.6f,%.6f|ALT:%.1f|",
-             Pitch_Sensor, Roll_Sensor, Yaw_Sensor,
-             RADAR_Latitude, RADAR_Longitude, RADAR_Altitude);
-    strcat(final_status, temp_buffer);
+    w = snprintf(status_buffer + off, rem, "IMU:%.1f,%.1f,%.1f|GPS:%.6f,%.6f|ALT:%.1f|",
+                 Pitch_Sensor, Roll_Sensor, Yaw_Sensor,
+                 RADAR_Latitude, RADAR_Longitude, RADAR_Altitude);
+    if (w > 0 && (size_t)w < rem) { off += (size_t)w; rem -= (size_t)w; }
 
     // LO Status
     bool tx_locked, rx_locked;
     ADF4382A_CheckLockStatus(&lo_manager, &tx_locked, &rx_locked);
-    snprintf(temp_buffer, sizeof(temp_buffer), "LO_TX:%s|LO_RX:%s|",
-             tx_locked ? "LOCKED" : "UNLOCKED",
-             rx_locked ? "LOCKED" : "UNLOCKED");
-    strcat(final_status, temp_buffer);
+    w = snprintf(status_buffer + off, rem, "LO_TX:%s|LO_RX:%s|",
+                 tx_locked ? "LOCKED" : "UNLOCKED",
+                 rx_locked ? "LOCKED" : "UNLOCKED");
+    if (w > 0 && (size_t)w < rem) { off += (size_t)w; rem -= (size_t)w; }
 
     // Temperature readings (8 variables)
-    // You'll need to populate these temperature values from your sensors
-    // For now, I'll show how to format them - replace with actual temperature readings
     Temperature_1 = ADS7830_Measure_SingleEnded(&hadc3, 0);
     Temperature_2 = ADS7830_Measure_SingleEnded(&hadc3, 1);
     Temperature_3 = ADS7830_Measure_SingleEnded(&hadc3, 2);
@@ -963,11 +974,11 @@ void getSystemStatusForGUI(char* status_buffer, size_t buffer_size) {
     Temperature_8 = ADS7830_Measure_SingleEnded(&hadc3, 7);
 
     // Format all 8 temperature variables
-    snprintf(temp_buffer, sizeof(temp_buffer),
-             "T1:%.1f|T2:%.1f|T3:%.1f|T4:%.1f|T5:%.1f|T6:%.1f|T7:%.1f|T8:%.1f|",
-             Temperature_1, Temperature_2, Temperature_3, Temperature_4,
-             Temperature_5, Temperature_6, Temperature_7, Temperature_8);
-    strcat(final_status, temp_buffer);
+    w = snprintf(status_buffer + off, rem,
+                 "T1:%.1f|T2:%.1f|T3:%.1f|T4:%.1f|T5:%.1f|T6:%.1f|T7:%.1f|T8:%.1f|",
+                 Temperature_1, Temperature_2, Temperature_3, Temperature_4,
+                 Temperature_5, Temperature_6, Temperature_7, Temperature_8);
+    if (w > 0 && (size_t)w < rem) { off += (size_t)w; rem -= (size_t)w; }
 
     // RF Power Amplifier status (if enabled)
     if (PowerAmplifier) {
@@ -977,18 +988,17 @@ void getSystemStatusForGUI(char* status_buffer, size_t buffer_size) {
         }
         avg_current /= 16.0f;
 
-        snprintf(temp_buffer, sizeof(temp_buffer), "PA_AvgCurrent:%.2f|PA_Enabled:%d|",
-                 avg_current, PowerAmplifier);
-        strcat(final_status, temp_buffer);
+        w = snprintf(status_buffer + off, rem, "PA_AvgCurrent:%.2f|PA_Enabled:%d|",
+                     avg_current, PowerAmplifier);
+        if (w > 0 && (size_t)w < rem) { off += (size_t)w; rem -= (size_t)w; }
     }
 
     // Radar operation status
-    snprintf(temp_buffer, sizeof(temp_buffer), "BeamPos:%d|Azimuth:%d|ChirpCount:%d|",
-             n, y, m);
-    strcat(final_status, temp_buffer);
+    w = snprintf(status_buffer + off, rem, "BeamPos:%d|Azimuth:%d|ChirpCount:%d|",
+                 n, y, m);
+    if (w > 0 && (size_t)w < rem) { off += (size_t)w; rem -= (size_t)w; }
 
-    // Copy to output buffer
-    strncpy(status_buffer, final_status, buffer_size - 1);
+    // NUL termination guaranteed by snprintf, but be safe
     status_buffer[buffer_size - 1] = '\0';
 }
 
@@ -1997,12 +2007,13 @@ int main(void)
 	        HAL_UART_Transmit(&huart3, (uint8_t*)emergency_msg, strlen(emergency_msg), 1000);
 	        DIAG_ERR("SYS", "SAFE MODE ACTIVE -- blinking all LEDs, waiting for system_emergency_state clear");
 
-	        // Blink all LEDs to indicate safe mode
+	        // Blink all LEDs to indicate safe mode (500ms period, visible to operator)
 	        while (system_emergency_state) {
 	            HAL_GPIO_TogglePin(LED_1_GPIO_Port, LED_1_Pin);
 	            HAL_GPIO_TogglePin(LED_2_GPIO_Port, LED_2_Pin);
 	            HAL_GPIO_TogglePin(LED_3_GPIO_Port, LED_3_Pin);
 	            HAL_GPIO_TogglePin(LED_4_GPIO_Port, LED_4_Pin);
+	            HAL_Delay(250);
 	        }
 	        DIAG("SYS", "Exited safe mode blink loop -- system_emergency_state cleared");
 	    }

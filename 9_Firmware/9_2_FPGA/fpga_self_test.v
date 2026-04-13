@@ -296,7 +296,7 @@ always @(posedge clk or negedge reset_n) begin
                     state           <= ST_DONE;
                 end
             end
-            // Timeout: if no ADC data after 10000 cycles, FAIL
+            // Timeout: if no ADC data after 1000 cycles (10 us @ 100 MHz), FAIL
             step_cnt <= step_cnt + 1;
             if (step_cnt >= 10'd1000 && adc_cap_cnt == 0) begin
                 result_flags[4] <= 1'b0;

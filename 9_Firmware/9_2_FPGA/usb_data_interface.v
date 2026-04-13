@@ -20,8 +20,8 @@ module usb_data_interface (
     // Control signals
     output reg ft601_txe_n,          // Transmit enable (active low)
     output reg ft601_rxf_n,          // Receive enable (active low)
-    input wire ft601_txe,             // Transmit FIFO empty
-    input wire ft601_rxf,             // Receive FIFO full
+    input wire ft601_txe,             // TXE: Transmit FIFO Not Full (high = space available to write)
+    input wire ft601_rxf,             // RXF: Receive FIFO Not Empty (high = data available to read)
     output reg ft601_wr_n,            // Write strobe (active low)
     output reg ft601_rd_n,            // Read strobe (active low)
     output reg ft601_oe_n,            // Output enable (active low)

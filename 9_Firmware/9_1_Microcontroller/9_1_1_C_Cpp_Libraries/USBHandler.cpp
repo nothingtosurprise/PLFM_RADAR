@@ -43,6 +43,11 @@ void USBHandler::processStartFlag(const uint8_t* data, uint32_t length) {
     // Start flag: bytes [23, 46, 158, 237]
     const uint8_t START_FLAG[] = {23, 46, 158, 237};
     
+    // Guard: need at least 4 bytes to contain a start flag.
+    // Without this, length - 4 wraps to ~4 billion (uint32_t unsigned underflow)
+    // and the loop reads far past the buffer boundary.
+    if (length < 4) return;
+    
     // Check if start flag is in the received data
     for (uint32_t i = 0; i <= length - 4; i++) {
         if (memcmp(data + i, START_FLAG, 4) == 0) {

@@ -46,7 +46,9 @@ jobs:
       - name: Unit tests
         run: >
           uv run pytest
-          9_Firmware/9_3_GUI/test_radar_dashboard.py -v --tb=short
+          9_Firmware/9_3_GUI/test_radar_dashboard.py
+          9_Firmware/9_3_GUI/test_v7.py
+          -v --tb=short
 
   # ===========================================================================
   # MCU Firmware Unit Tests (20 tests)

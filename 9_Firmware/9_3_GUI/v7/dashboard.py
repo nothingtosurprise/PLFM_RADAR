@@ -150,6 +150,7 @@ class RadarDashboard(QMainWindow):
         self._last_status: StatusResponse | None = None
         self._frame_count = 0
         self._gps_packet_count = 0
+        self._last_stats: dict = {}
         self._current_targets: list[RadarTarget] = []
 
         # FPGA control parameter widgets
@@ -1312,7 +1313,13 @@ class RadarDashboard(QMainWindow):
             self._simulator.stop()
             self._simulator = None
         self._demo_mode = False
-        self._sb_mode.setText("Idle" if not self._running else "Live")
+        if not self._running:
+            mode = "Idle"
+        elif isinstance(self._connection, ReplayConnection):
+            mode = "Replay"
+        else:
+            mode = "Live"
+        self._sb_mode.setText(mode)
         self._sb_status.setText("Demo stopped")
         self._demo_btn_main.setText("Start Demo")
         self._demo_btn_map.setText("Start Demo")
@@ -1359,7 +1366,7 @@ class RadarDashboard(QMainWindow):
 
     @pyqtSlot(dict)
     def _on_radar_stats(self, stats: dict):
-        pass  # Stats are displayed in _refresh_gui
+        self._last_stats = stats
 
     @pyqtSlot(str)
     def _on_worker_error(self, msg: str):
@@ -1670,7 +1677,7 @@ class RadarDashboard(QMainWindow):
             str(self._frame_count),
             str(det),
             str(gps_count),
-            "0",  # errors
+            str(self._last_stats.get("errors", 0)),
             f"{uptime:.0f}s",
             f"{frame_rate:.1f}/s",
         ]

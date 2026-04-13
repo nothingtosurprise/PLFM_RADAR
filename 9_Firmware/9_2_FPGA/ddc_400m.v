@@ -102,14 +102,19 @@ wire signed [17:0] debug_mixed_q_trunc;
 reg [7:0] signal_power_i, signal_power_q;
 
 // Internal mixing signals
-// DSP48E1 with AREG=1, BREG=1, MREG=1, PREG=1 handles all internal pipelining
-// Latency: 4 cycles (1 for AREG/BREG, 1 for MREG, 1 for PREG, 1 for post-DSP retiming)
+// Pipeline: NCO fabric reg (1) + DSP48E1 AREG/BREG (1) + MREG (1) + PREG (1) + retiming (1) = 5 cycles
+// The NCO fabric pipeline register was added to break the long NCO→DSP B-port route
+// (1.505ns routing in Build 26, WNS=+0.002ns). With BREG=1 still active inside the DSP,
+// total latency increases by 1 cycle (2.5ns at 400MHz — negligible for radar).
 wire signed [MIXER_WIDTH-1:0] adc_signed_w;
 reg signed [MIXER_WIDTH + NCO_WIDTH -1:0] mixed_i, mixed_q;
 reg mixed_valid;
 reg mixer_overflow_i, mixer_overflow_q;
-// Pipeline valid tracking: 4-stage shift register (3 for DSP48E1 + 1 for post-DSP retiming)
-reg [3:0] dsp_valid_pipe;
+// Pipeline valid tracking: 5-stage shift register (1 NCO pipe + 3 DSP48E1 + 1 retiming)
+reg [4:0] dsp_valid_pipe;
+// NCO→DSP pipeline registers — breaks the long NCO sin/cos → DSP48E1 B-port route
+// DONT_TOUCH prevents Vivado from absorbing these into the DSP or optimizing away
+(* DONT_TOUCH = "TRUE" *) reg signed [15:0] cos_nco_pipe, sin_nco_pipe;
 // Post-DSP retiming registers — breaks DSP48E1 CLK→P to fabric timing path
 // This extra pipeline stage absorbs the 1.866ns DSP output prop delay + routing,
 // ensuring WNS > 0 at 400 MHz regardless of placement seed
@@ -210,11 +215,11 @@ nco_400m_enhanced nco_core (
 //
 // Architecture:
 //   ADC data → sign-extend to 18b → DSP48E1 A-port (AREG=1 pipelines it)
-//   NCO cos/sin → sign-extend to 18b → DSP48E1 B-port (BREG=1 pipelines it)
+//   NCO cos/sin → fabric pipeline reg → DSP48E1 B-port (BREG=1 pipelines it)
 //   Multiply result captured by MREG=1, then output registered by PREG=1
 //   force_saturation override applied AFTER DSP48E1 output (not on input path)
 //
-// Latency: 3 clock cycles (AREG/BREG + MREG + PREG)
+// Latency: 4 clock cycles (1 NCO pipe + 1 AREG/BREG + 1 MREG + 1 PREG) + 1 retiming = 5 total
 // PREG=1 absorbs DSP48E1 CLK→P delay internally, preventing fabric timing violations
 // In simulation (Icarus), uses behavioral equivalent since DSP48E1 is Xilinx-only
 // ============================================================================
@@ -223,24 +228,35 @@ nco_400m_enhanced nco_core (
 assign adc_signed_w = {1'b0, adc_data, {(MIXER_WIDTH-ADC_WIDTH-1){1'b0}}} - 
                       {1'b0, {ADC_WIDTH{1'b1}}, {(MIXER_WIDTH-ADC_WIDTH-1){1'b0}}} / 2;
 
-// Valid pipeline: 4-stage shift register (3 for DSP48E1 AREG+MREG+PREG + 1 for retiming)
+// Valid pipeline: 5-stage shift register (1 NCO pipe + 3 DSP48E1 AREG+MREG+PREG + 1 retiming)
 always @(posedge clk_400m or negedge reset_n_400m) begin
     if (!reset_n_400m) begin
-        dsp_valid_pipe <= 4'b0000;
+        dsp_valid_pipe <= 5'b00000;
     end else begin
-        dsp_valid_pipe <= {dsp_valid_pipe[2:0], (nco_ready && adc_data_valid_i && adc_data_valid_q)};
+        dsp_valid_pipe <= {dsp_valid_pipe[3:0], (nco_ready && adc_data_valid_i && adc_data_valid_q)};
     end
 end
 
 `ifdef SIMULATION
 // ---- Behavioral model for Icarus Verilog simulation ----
-// Mimics DSP48E1 with AREG=1, BREG=1, MREG=1, PREG=1 (3-cycle latency)
+// Mimics NCO pipeline + DSP48E1 with AREG=1, BREG=1, MREG=1, PREG=1 (4-cycle DSP + 1 NCO pipe)
 reg signed [MIXER_WIDTH-1:0] adc_signed_reg;     // Models AREG
 reg signed [15:0] cos_pipe_reg, sin_pipe_reg;     // Models BREG
 reg signed [MIXER_WIDTH+NCO_WIDTH-1:0] mult_i_internal, mult_q_internal;  // Models MREG
 reg signed [MIXER_WIDTH+NCO_WIDTH-1:0] mult_i_reg, mult_q_reg;            // Models PREG
 
-// Stage 1: AREG/BREG equivalent
+// Stage 0: NCO pipeline — breaks long NCO→DSP route (matches synthesis fabric registers)
+always @(posedge clk_400m or negedge reset_n_400m) begin
+    if (!reset_n_400m) begin
+        cos_nco_pipe <= 0;
+        sin_nco_pipe <= 0;
+    end else begin
+        cos_nco_pipe <= cos_out;
+        sin_nco_pipe <= sin_out;
+    end
+end
+
+// Stage 1: AREG/BREG equivalent (uses pipelined NCO outputs)
 always @(posedge clk_400m or negedge reset_n_400m) begin
     if (!reset_n_400m) begin
         adc_signed_reg <= 0;
@@ -248,8 +264,8 @@ always @(posedge clk_400m or negedge reset_n_400m) begin
         sin_pipe_reg <= 0;
     end else begin
         adc_signed_reg <= adc_signed_w;
-        cos_pipe_reg <= cos_out;
-        sin_pipe_reg <= sin_out;
+        cos_pipe_reg <= cos_nco_pipe;
+        sin_pipe_reg <= sin_nco_pipe;
     end
 end
 
@@ -290,6 +306,20 @@ end
 // ---- Direct DSP48E1 instantiation for Vivado synthesis ----
 // This guarantees AREG/BREG/MREG are used, achieving timing closure at 400 MHz
 wire [47:0] dsp_p_i, dsp_p_q;
+
+// NCO pipeline stage — breaks the long NCO sin/cos → DSP48E1 B-port route
+// (1.505ns routing observed in Build 26). These fabric registers are placed
+// near the DSP by the placer, splitting the route into two shorter segments.
+// DONT_TOUCH on the reg declaration (above) prevents absorption/retiming.
+always @(posedge clk_400m or negedge reset_n_400m) begin
+    if (!reset_n_400m) begin
+        cos_nco_pipe <= 0;
+        sin_nco_pipe <= 0;
+    end else begin
+        cos_nco_pipe <= cos_out;
+        sin_nco_pipe <= sin_out;
+    end
+end
 
 // DSP48E1 for I-channel mixer (adc_signed * cos_out)
 DSP48E1 #(
@@ -350,7 +380,7 @@ DSP48E1 #(
     .CEINMODE(1'b0),
     // Data ports
     .A({{12{adc_signed_w[MIXER_WIDTH-1]}}, adc_signed_w}),   // Sign-extend 18b to 30b
-    .B({{2{cos_out[15]}}, cos_out}),                          // Sign-extend 16b to 18b
+    .B({{2{cos_nco_pipe[15]}}, cos_nco_pipe}),                // Sign-extend 16b to 18b (pipelined)
     .C(48'b0),
     .D(25'b0),
     .CARRYIN(1'b0),
@@ -432,7 +462,7 @@ DSP48E1 #(
     .CED(1'b0),
     .CEINMODE(1'b0),
     .A({{12{adc_signed_w[MIXER_WIDTH-1]}}, adc_signed_w}),
-    .B({{2{sin_out[15]}}, sin_out}),
+    .B({{2{sin_nco_pipe[15]}}, sin_nco_pipe}),
     .C(48'b0),
     .D(25'b0),
     .CARRYIN(1'b0),
@@ -492,7 +522,7 @@ always @(posedge clk_400m or negedge reset_n_400m) begin
         mixer_overflow_q <= 0;
         saturation_count <= 0;
         overflow_detected <= 0;
-    end else if (dsp_valid_pipe[3]) begin
+    end else if (dsp_valid_pipe[4]) begin
         // Force saturation for testing (applied after DSP output, not on input path)
         if (force_saturation_sync) begin
             mixed_i <= 34'h1FFFFFFFF;

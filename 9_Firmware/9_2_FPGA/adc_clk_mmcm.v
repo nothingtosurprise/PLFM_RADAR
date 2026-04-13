@@ -212,6 +212,11 @@ BUFG bufg_feedback (
 
 // ---- Output BUFG ----
 // Routes the jitter-cleaned 400 MHz CLKOUT0 onto a global clock network.
+// DONT_TOUCH prevents phys_opt_design AggressiveExplore from replicating this
+// BUFG into a cascaded chain (4 BUFGs in series observed in Build 26), which
+// added ~243ps of clock insertion delay and caused -187ps clock skew on the
+// NCO→DSP mixer critical path.
+(* DONT_TOUCH = "TRUE" *)
 BUFG bufg_clk400m (
     .I(clk_mmcm_out0),
     .O(clk_400m_out)
